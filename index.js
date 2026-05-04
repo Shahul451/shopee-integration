@@ -118,19 +118,29 @@ app.get("/auth", (req, res) => {
 app.get("/callback", async (req, res) => {
     try {
         const { code, shop_id } = req.query;
+        console.log("📥 Callback received - code:", code, "shop_id:", shop_id);
+        
         const path = "/api/v2/auth/token/get";
         const timestamp = Math.floor(Date.now() / 1000);
         const sign = generateSign(`${PARTNER_ID}${path}${timestamp}`);
 
+        console.log("🔑 Requesting token from Shopee...");
         const response = await axios.post(`${BASE_URL}${path}`, 
             { code, shop_id: Number(shop_id), partner_id: PARTNER_ID },
             { params: { partner_id: PARTNER_ID, timestamp, sign } }
         );
 
+        console.log("✅ Token response:", JSON.stringify(response.data));
         updateEnv({ access_token: response.data.access_token, refresh_token: response.data.refresh_token, shop_id: shop_id });
         res.send("Auth Successful ✅ Tokens saved to .env. You can now use the APIs.");
     } catch (err) {
-        res.status(500).send(err.response?.data || "Token error");
+        const errorDetails = {
+            message: err.message,
+            shopee_error: err.response?.data || null,
+            status: err.response?.status || null
+        };
+        console.error("❌ Callback error:", JSON.stringify(errorDetails));
+        res.status(500).json(errorDetails);
     }
 });
 
