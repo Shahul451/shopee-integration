@@ -14,38 +14,43 @@ const PARTNER_KEY = process.env.PARTNER_KEY;
 const BASE_URL = process.env.BASE_URL;
 const REDIRECT_URL = process.env.REDIRECT_URL;
 
-// 📝 Helper to update .env file automatically
+// 📝 Helper to update tokens (works on both local and Azure)
 function updateEnv(newTokens) {
+    // Always update process.env in memory
+    if (newTokens.access_token) process.env.ACCESS_TOKEN = newTokens.access_token;
+    if (newTokens.refresh_token) process.env.REFRESH_TOKEN = newTokens.refresh_token;
+    if (newTokens.shop_id) process.env.SHOP_ID = newTokens.shop_id;
+
+    // Try to update .env file (only works locally, not on Azure)
     const envPath = path.join(__dirname, ".env");
-    let envContent = fs.readFileSync(envPath, "utf8");
+    try {
+        if (fs.existsSync(envPath)) {
+            let envContent = fs.readFileSync(envPath, "utf8");
 
-    if (newTokens.access_token) {
-        if (envContent.match(/ACCESS_TOKEN=.*/)) {
-            envContent = envContent.replace(/ACCESS_TOKEN=.*/, `ACCESS_TOKEN=${newTokens.access_token}`);
-        } else {
-            envContent += `\nACCESS_TOKEN=${newTokens.access_token}`;
-        }
-        process.env.ACCESS_TOKEN = newTokens.access_token;
-    }
-    if (newTokens.refresh_token) {
-        if (envContent.match(/REFRESH_TOKEN=.*/)) {
-            envContent = envContent.replace(/REFRESH_TOKEN=.*/, `REFRESH_TOKEN=${newTokens.refresh_token}`);
-        } else {
-            envContent += `\nREFRESH_TOKEN=${newTokens.refresh_token}`;
-        }
-        process.env.REFRESH_TOKEN = newTokens.refresh_token;
-    }
-    if (newTokens.shop_id) {
-        if (envContent.match(/SHOP_ID=.*/)) {
-            envContent = envContent.replace(/SHOP_ID=.*/, `SHOP_ID=${newTokens.shop_id}`);
-        } else {
-            envContent += `\nSHOP_ID=${newTokens.shop_id}`;
-        }
-        process.env.SHOP_ID = newTokens.shop_id;
-    }
+            if (newTokens.access_token) {
+                envContent = envContent.match(/ACCESS_TOKEN=.*/)
+                    ? envContent.replace(/ACCESS_TOKEN=.*/, `ACCESS_TOKEN=${newTokens.access_token}`)
+                    : envContent + `\nACCESS_TOKEN=${newTokens.access_token}`;
+            }
+            if (newTokens.refresh_token) {
+                envContent = envContent.match(/REFRESH_TOKEN=.*/)
+                    ? envContent.replace(/REFRESH_TOKEN=.*/, `REFRESH_TOKEN=${newTokens.refresh_token}`)
+                    : envContent + `\nREFRESH_TOKEN=${newTokens.refresh_token}`;
+            }
+            if (newTokens.shop_id) {
+                envContent = envContent.match(/SHOP_ID=.*/)
+                    ? envContent.replace(/SHOP_ID=.*/, `SHOP_ID=${newTokens.shop_id}`)
+                    : envContent + `\nSHOP_ID=${newTokens.shop_id}`;
+            }
 
-    fs.writeFileSync(envPath, envContent);
-    console.log("✅ .env file updated automatically.");
+            fs.writeFileSync(envPath, envContent);
+            console.log("✅ .env file updated automatically.");
+        } else {
+            console.log("✅ Tokens updated in memory (no .env file found - Azure mode).");
+        }
+    } catch (err) {
+        console.log("⚠️ Could not update .env file, tokens stored in memory only:", err.message);
+    }
 }
 
 // 🔐 Generate SIGN
