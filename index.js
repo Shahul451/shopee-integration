@@ -14,6 +14,27 @@ const PARTNER_KEY = process.env.PARTNER_KEY;
 const BASE_URL = process.env.BASE_URL;
 const REDIRECT_URL = process.env.REDIRECT_URL;
 
+// 📂 Persistent token storage path (Azure /home/ is persistent, local uses project dir)
+const TOKEN_FILE = process.env.HOME 
+    ? path.join(process.env.HOME, "tokens.json")  // Azure: /home/tokens.json
+    : path.join(__dirname, "tokens.json");          // Local: ./tokens.json
+
+// 🔄 Load saved tokens on startup (survives Azure restarts)
+function loadTokens() {
+    try {
+        if (fs.existsSync(TOKEN_FILE)) {
+            const saved = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8"));
+            if (saved.access_token) process.env.ACCESS_TOKEN = saved.access_token;
+            if (saved.refresh_token) process.env.REFRESH_TOKEN = saved.refresh_token;
+            if (saved.shop_id) process.env.SHOP_ID = saved.shop_id;
+            console.log("✅ Loaded tokens from persistent storage.");
+        }
+    } catch (err) {
+        console.log("⚠️ Could not load saved tokens:", err.message);
+    }
+}
+loadTokens();
+
 // 📝 Helper to update tokens (works on both local and Azure)
 function updateEnv(newTokens) {
     // Always update process.env in memory
@@ -21,7 +42,21 @@ function updateEnv(newTokens) {
     if (newTokens.refresh_token) process.env.REFRESH_TOKEN = newTokens.refresh_token;
     if (newTokens.shop_id) process.env.SHOP_ID = newTokens.shop_id;
 
-    // Try to update .env file (only works locally, not on Azure)
+    // Save to persistent JSON file (works on both local and Azure)
+    try {
+        const tokenData = {
+            access_token: process.env.ACCESS_TOKEN,
+            refresh_token: process.env.REFRESH_TOKEN,
+            shop_id: process.env.SHOP_ID,
+            updated_at: new Date().toISOString()
+        };
+        fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokenData, null, 2));
+        console.log("✅ Tokens saved to persistent storage:", TOKEN_FILE);
+    } catch (err) {
+        console.log("⚠️ Could not save tokens to file:", err.message);
+    }
+
+    // Also try to update .env file (for local development)
     const envPath = path.join(__dirname, ".env");
     try {
         if (fs.existsSync(envPath)) {
@@ -45,11 +80,9 @@ function updateEnv(newTokens) {
 
             fs.writeFileSync(envPath, envContent);
             console.log("✅ .env file updated automatically.");
-        } else {
-            console.log("✅ Tokens updated in memory (no .env file found - Azure mode).");
         }
     } catch (err) {
-        console.log("⚠️ Could not update .env file, tokens stored in memory only:", err.message);
+        console.log("⚠️ Could not update .env file:", err.message);
     }
 }
 
@@ -152,49 +185,82 @@ app.get("/callback", async (req, res) => {
 ///////////////////////////////////////////////////////////
 // 📦 ORDER FILTERING
 ///////////////////////////////////////////////////////////
-app.get("/orders-by-arranged-date", async (req, res) => {
+app.get("/orders-by-ship-date", async (req, res) => {
     try {
         const targetDateStr = req.query.date || new Date().toISOString().split('T')[0];
-        console.log(`🔍 Filtering orders ARRANGED on: ${targetDateStr}`);
+        console.log(`🔍 Filtering orders by ship date: ${targetDateStr}`);
 
-        // 1. Get List
-        const listRes = await shopeeRequest("get", "/api/v2/order/get_order_list", {
-            page_size: 50, time_range_field: "create_time",
-            time_from: Math.floor(Date.now() / 1000) - (15 * 86400),
-            time_to: Math.floor(Date.now() / 1000)
-        });
+        // Set time_from to start of target date locally, and time_to to now.
+        // If an order shipped on targetDate, its update_time is >= targetDate
+        const [yyyy, mm, dd] = targetDateStr.split('-');
+        const targetDateStart = new Date(yyyy, mm - 1, dd, 0, 0, 0);
+        const timeFrom = Math.floor(targetDateStart.getTime() / 1000);
+        const timeTo = Math.floor(Date.now() / 1000);
 
-        const orderSnList = listRes.data.response.order_list.map(o => o.order_sn);
-        const matchingSns = [];
-
-        // 2. Check Tracking (Iterative)
-        for (const order_sn of orderSnList) {
-            try {
-                const trackRes = await shopeeRequest("get", "/api/v2/logistics/get_tracking_info", { order_sn });
-                const history = trackRes.data.response.tracking_info;
-                const arrangeEvent = history.find(h => h.description.includes("Sender is preparing to ship"));
-                if (arrangeEvent) {
-                    if (new Date(arrangeEvent.update_time * 1000).toISOString().split('T')[0] === targetDateStr) {
-                        matchingSns.push(order_sn);
-                    }
-                }
-            } catch (e) { continue; }
+        // 1. Get List with Pagination
+        let allOrders = [];
+        let hasNext = true;
+        let cursor = "";
+        while(hasNext) {
+            const listRes = await shopeeRequest("get", "/api/v2/order/get_order_list", {
+                page_size: 100, time_range_field: "update_time",
+                time_from: timeFrom, time_to: timeTo, cursor: cursor
+            });
+            const response = listRes.data.response;
+            allOrders = allOrders.concat(response.order_list || []);
+            hasNext = response.more;
+            cursor = response.next_cursor;
+            if (allOrders.length > 2000) break; // Safeguard
         }
 
-        // 3. Get Details
-        let detailedMatches = [];
-        if (matchingSns.length > 0) {
-            const detailRes = await shopeeRequest("get", "/api/v2/order/get_order_detail", {
-                order_sn_list: matchingSns.join(","),
-                response_optional_fields: "item_list,buyer_username,recipient_address,order_status"
-            });
-            detailedMatches = detailRes.data.response.order_list;
+        const orderSnList = allOrders.map(o => o.order_sn);
 
-            // Optional Status Filter
-            if (req.query.status) {
-                const targetStatus = req.query.status.toUpperCase();
+        let detailedMatches = [];
+        if (orderSnList.length > 0) {
+            // 2. Get Details in chunks of 50 (Shopee API limit per request)
+            let allDetails = [];
+            for (let i = 0; i < orderSnList.length; i += 50) {
+                const chunk = orderSnList.slice(i, i + 50);
+                const detailRes = await shopeeRequest("get", "/api/v2/order/get_order_detail", {
+                    order_sn_list: chunk.join(","),
+                    response_optional_fields: "item_list,buyer_username,recipient_address,order_status,pickup_done_time"
+                });
+                allDetails = allDetails.concat(detailRes.data.response.order_list);
+            }
+
+            // 3. Filter Details by pickup_done_time (True 'Ship Time' in Excel)
+            detailedMatches = allDetails.filter(order => {
+                if (!order.pickup_done_time) return false;
+                
+                const d = new Date(order.pickup_done_time * 1000);
+                const pad = (n) => n.toString().padStart(2, '0');
+                const orderShipDateStr = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+                
+                return orderShipDateStr === targetDateStr;
+            });
+
+            // Status Filter - strictly enforce SHIPPED by default as requested
+            const targetStatus = (req.query.status || "SHIPPED").toUpperCase();
+            if (targetStatus !== "ALL") {
                 detailedMatches = detailedMatches.filter(order => order.order_status === targetStatus);
             }
+
+            // Format dates and add 'ship_time' matching the Excel export
+            detailedMatches = detailedMatches.map(order => {
+                const formatTime = (ts) => {
+                    if (!ts) return null;
+                    const d = new Date(ts * 1000);
+                    const pad = (n) => n.toString().padStart(2, '0');
+                    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+                };
+
+                return {
+                    ...order,
+                    ship_time: formatTime(order.pickup_done_time), // Corresponds to 'Ship Time' in Excel
+                    estimated_ship_out_date: formatTime(order.ship_by_date),
+                    order_creation_date: formatTime(order.create_time)
+                };
+            });
         }
 
         res.json({ 
@@ -210,4 +276,27 @@ app.get("/orders-by-arranged-date", async (req, res) => {
 
 app.get("/", (req, res) => res.send("Shopee Integration Fully Automated 🚀"));
 
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+// 🔄 Manual refresh endpoint
+app.get("/refresh", async (req, res) => {
+    const result = await refreshAccessToken();
+    if (result) {
+        res.json({ success: true, message: "Tokens refreshed!", access_token: result.access_token });
+    } else {
+        res.status(500).json({ success: false, message: "Refresh failed. You may need to re-authenticate via /auth" });
+    }
+});
+
+app.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    
+    // ⏰ Auto-refresh tokens every 3 hours to keep them alive
+    setInterval(async () => {
+        console.log("⏰ Scheduled token refresh...");
+        const result = await refreshAccessToken();
+        if (result) {
+            console.log("✅ Scheduled refresh successful!");
+        } else {
+            console.log("❌ Scheduled refresh failed - tokens may have expired.");
+        }
+    }, 3 * 60 * 60 * 1000); // Every 3 hours
+});
