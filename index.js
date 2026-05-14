@@ -188,13 +188,11 @@ app.get("/callback", async (req, res) => {
 app.get("/orders-by-ship-date", async (req, res) => {
     try {
         const targetDateStr = req.query.date || new Date().toISOString().split('T')[0];
-        console.log(`🔍 Filtering orders by ship date: ${targetDateStr}`);
+        console.log(`🔍 Filtering orders by ship date: ${targetDateStr} (SGT)`);
 
-        // Set time_from to start of target date locally, and time_to to now.
-        // If an order shipped on targetDate, its update_time is >= targetDate
-        const [yyyy, mm, dd] = targetDateStr.split('-');
-        const targetDateStart = new Date(yyyy, mm - 1, dd, 0, 0, 0);
-        const timeFrom = Math.floor(targetDateStart.getTime() / 1000);
+        // Set time_from to start of target date in SGT (UTC+8)
+        const targetDateSGTStart = new Date(`${targetDateStr}T00:00:00+08:00`);
+        const timeFrom = Math.floor(targetDateSGTStart.getTime() / 1000);
         const timeTo = Math.floor(Date.now() / 1000);
 
         // 1. Get List with Pagination
@@ -228,13 +226,14 @@ app.get("/orders-by-ship-date", async (req, res) => {
                 allDetails = allDetails.concat(detailRes.data.response.order_list);
             }
 
-            // 3. Filter Details by pickup_done_time (True 'Ship Time' in Excel)
+            // 3. Filter Details by pickup_done_time (True 'Ship Time' in Excel) using SGT
             detailedMatches = allDetails.filter(order => {
                 if (!order.pickup_done_time) return false;
                 
-                const d = new Date(order.pickup_done_time * 1000);
+                // Add 8 hours to get SGT time
+                const d = new Date((order.pickup_done_time + 8 * 3600) * 1000);
                 const pad = (n) => n.toString().padStart(2, '0');
-                const orderShipDateStr = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+                const orderShipDateStr = d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate());
                 
                 return orderShipDateStr === targetDateStr;
             });
@@ -245,27 +244,27 @@ app.get("/orders-by-ship-date", async (req, res) => {
                 detailedMatches = detailedMatches.filter(order => order.order_status === targetStatus);
             }
 
-            // Format dates and add 'ship_time' matching the Excel export
+            // Format dates and add 'ship_time' explicitly using SGT
             detailedMatches = detailedMatches.map(order => {
-                const formatTime = (ts) => {
+                const formatTimeSGT = (ts) => {
                     if (!ts) return null;
-                    const d = new Date(ts * 1000);
+                    const d = new Date((ts + 8 * 3600) * 1000);
                     const pad = (n) => n.toString().padStart(2, '0');
-                    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+                    return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
                 };
 
                 return {
                     ...order,
-                    ship_time: formatTime(order.pickup_done_time), // Corresponds to 'Ship Time' in Excel
-                    estimated_ship_out_date: formatTime(order.ship_by_date),
-                    order_creation_date: formatTime(order.create_time)
+                    ship_time: formatTimeSGT(order.pickup_done_time),
+                    estimated_ship_out_date: formatTimeSGT(order.ship_by_date),
+                    order_creation_date: formatTimeSGT(order.create_time)
                 };
             });
         }
 
         res.json({ 
             date: targetDateStr, 
-            status_filter: req.query.status || "ALL",
+            status_filter: req.query.status || "SHIPPED",
             total: detailedMatches.length, 
             orders: detailedMatches 
         });
