@@ -253,11 +253,11 @@ app.get("/orders-by-ship-date", async (req, res) => {
                     return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
                 };
 
-                // Compute product_subtotal per item (deal_price × quantity)
-                // and add a order-level product_subtotal summing all items
+                // Compute product_subtotal per item (model_discounted_price × quantity)
+                // and add an order-level product_subtotal summing all items
                 const enrichedItems = (order.item_list || []).map(item => ({
                     ...item,
-                    product_subtotal: parseFloat(((item.deal_price || 0) * (item.model_quantity_purchased || 1)).toFixed(2))
+                    product_subtotal: parseFloat(((item.model_discounted_price || 0) * (item.model_quantity_purchased || 1)).toFixed(2))
                 }));
 
                 const orderProductSubtotal = parseFloat(
