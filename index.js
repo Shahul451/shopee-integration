@@ -221,7 +221,7 @@ app.get("/orders-by-ship-date", async (req, res) => {
                 const chunk = orderSnList.slice(i, i + 50);
                 const detailRes = await shopeeRequest("get", "/api/v2/order/get_order_detail", {
                     order_sn_list: chunk.join(","),
-                    response_optional_fields: "item_list,buyer_username,recipient_address,order_status,pickup_done_time"
+                    response_optional_fields: "item_list,buyer_username,recipient_address,order_status,pickup_done_time,total_amount"
                 });
                 allDetails = allDetails.concat(detailRes.data.response.order_list);
             }
@@ -253,8 +253,21 @@ app.get("/orders-by-ship-date", async (req, res) => {
                     return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
                 };
 
+                // Compute product_subtotal per item (deal_price × quantity)
+                // and add a order-level product_subtotal summing all items
+                const enrichedItems = (order.item_list || []).map(item => ({
+                    ...item,
+                    product_subtotal: parseFloat(((item.deal_price || 0) * (item.model_quantity_purchased || 1)).toFixed(2))
+                }));
+
+                const orderProductSubtotal = parseFloat(
+                    enrichedItems.reduce((sum, item) => sum + item.product_subtotal, 0).toFixed(2)
+                );
+
                 return {
                     ...order,
+                    item_list: enrichedItems,
+                    product_subtotal: orderProductSubtotal,
                     ship_time: formatTimeSGT(order.pickup_done_time),
                     estimated_ship_out_date: formatTimeSGT(order.ship_by_date),
                     order_creation_date: formatTimeSGT(order.create_time)
