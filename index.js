@@ -15,7 +15,7 @@ const BASE_URL = process.env.BASE_URL;
 const REDIRECT_URL = process.env.REDIRECT_URL;
 
 // 📂 Persistent token storage path (Azure /home/ is persistent, local uses project dir)
-const TOKEN_FILE = process.env.HOME 
+const TOKEN_FILE = process.env.HOME
     ? path.join(process.env.HOME, "tokens.json")  // Azure: /home/tokens.json
     : path.join(__dirname, "tokens.json");          // Local: ./tokens.json
 
@@ -128,7 +128,7 @@ async function refreshAccessToken() {
         const timestamp = Math.floor(Date.now() / 1000);
         const sign = generateSign(`${PARTNER_ID}${path}${timestamp}`);
 
-        const res = await axios.post(`${BASE_URL}${path}`, 
+        const res = await axios.post(`${BASE_URL}${path}`,
             { refresh_token: process.env.REFRESH_TOKEN, shop_id: Number(process.env.SHOP_ID), partner_id: PARTNER_ID },
             { params: { partner_id: PARTNER_ID, timestamp, sign } }
         );
@@ -157,13 +157,13 @@ app.get("/callback", async (req, res) => {
     try {
         const { code, shop_id } = req.query;
         console.log("📥 Callback received - code:", code, "shop_id:", shop_id);
-        
+
         const path = "/api/v2/auth/token/get";
         const timestamp = Math.floor(Date.now() / 1000);
         const sign = generateSign(`${PARTNER_ID}${path}${timestamp}`);
 
         console.log("🔑 Requesting token from Shopee...");
-        const response = await axios.post(`${BASE_URL}${path}`, 
+        const response = await axios.post(`${BASE_URL}${path}`,
             { code, shop_id: Number(shop_id), partner_id: PARTNER_ID },
             { params: { partner_id: PARTNER_ID, timestamp, sign } }
         );
@@ -190,16 +190,20 @@ app.get("/orders-by-ship-date", async (req, res) => {
         const targetDateStr = req.query.date || new Date().toISOString().split('T')[0];
         console.log(`🔍 Filtering orders by ship date: ${targetDateStr} (SGT)`);
 
-        // Set time_from to start of target date in SGT (UTC+8)
+        // Set time window around target date in SGT (UTC+8)
+        // timeFrom: 2 days before target date start in SGT (to capture orders whose update_time
+        //           may fall before the target SGT midnight, e.g. orders shipped early SGT morning)
+        // timeTo:   end of target date in SGT + 1 day buffer for safety
         const targetDateSGTStart = new Date(`${targetDateStr}T00:00:00+08:00`);
-        const timeFrom = Math.floor(targetDateSGTStart.getTime() / 1000);
-        const timeTo = Math.floor(Date.now() / 1000);
+        const targetDateSGTEnd   = new Date(`${targetDateStr}T23:59:59+08:00`);
+        const timeFrom = Math.floor(targetDateSGTStart.getTime() / 1000) - (2 * 24 * 3600); // 2 days earlier
+        const timeTo   = Math.floor(targetDateSGTEnd.getTime()   / 1000) + (24 * 3600);     // +1 day buffer
 
         // 1. Get List with Pagination
         let allOrders = [];
         let hasNext = true;
         let cursor = "";
-        while(hasNext) {
+        while (hasNext) {
             const listRes = await shopeeRequest("get", "/api/v2/order/get_order_list", {
                 page_size: 100, time_range_field: "update_time",
                 time_from: timeFrom, time_to: timeTo, cursor: cursor
@@ -229,12 +233,12 @@ app.get("/orders-by-ship-date", async (req, res) => {
             // 3. Filter Details by pickup_done_time (True 'Ship Time' in Excel) using SGT
             detailedMatches = allDetails.filter(order => {
                 if (!order.pickup_done_time) return false;
-                
+
                 // Add 8 hours to get SGT time
                 const d = new Date((order.pickup_done_time + 8 * 3600) * 1000);
                 const pad = (n) => n.toString().padStart(2, '0');
                 const orderShipDateStr = d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate());
-                
+
                 return orderShipDateStr === targetDateStr;
             });
 
@@ -275,11 +279,11 @@ app.get("/orders-by-ship-date", async (req, res) => {
             });
         }
 
-        res.json({ 
-            date: targetDateStr, 
+        res.json({
+            date: targetDateStr,
             status_filter: req.query.status || "SHIPPED",
-            total: detailedMatches.length, 
-            orders: detailedMatches 
+            total: detailedMatches.length,
+            orders: detailedMatches
         });
     } catch (err) {
         res.status(500).json({ error: "Error", details: err.message });
@@ -300,7 +304,7 @@ app.get("/refresh", async (req, res) => {
 
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
-    
+
     // ⏰ Auto-refresh tokens every 3 hours to keep them alive
     setInterval(async () => {
         console.log("⏰ Scheduled token refresh...");
