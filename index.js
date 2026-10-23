@@ -86,16 +86,45 @@ function updateEnv(newTokens) {
     }
 }
 
+// 🕒 Check how old the stored tokens are
+function getTokenAge() {
+    try {
+        if (fs.existsSync(TOKEN_FILE)) {
+            const saved = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8"));
+            if (saved.updated_at) {
+                const ageMs = Date.now() - new Date(saved.updated_at).getTime();
+                const ageDays = Math.floor(ageMs / (1000 * 60 * 60 * 24));
+                const ageHours = Math.floor((ageMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+                return { ageDays, ageHours, updated_at: saved.updated_at, likelyExpired: ageDays >= 30 };
+            }
+        }
+    } catch (e) {}
+    return { ageDays: null, ageHours: null, updated_at: null, likelyExpired: true };
+}
+
 // 🔐 Generate SIGN
 function generateSign(baseString) {
     return crypto.createHmac("sha256", PARTNER_KEY).update(baseString).digest("hex");
 }
 
+// 🔄 Check if a Shopee response indicates an auth error
+// Shopee often returns HTTP 200 with error:"error_auth" instead of a real 403
+function isShopeeAuthError(response) {
+    const err = response?.data?.error || response?.data?.message || "";
+    return (
+        response?.status === 403 ||
+        err === "error_auth" ||
+        err === "Invalid access_token." ||
+        (typeof err === "string" && err.toLowerCase().includes("access_token"))
+    );
+}
+
 // 🔄 Auto-Refresh Wrapper
-async function shopeeRequest(method, apiPath, params = {}, body = null) {
-    const timestamp = Math.floor(Date.now() / 1000);
+async function shopeeRequest(method, apiPath, params = {}, body = null, _retried = false) {
+    // Always read fresh tokens from process.env (updated after each refresh)
     const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
     const SHOP_ID = process.env.SHOP_ID;
+    const timestamp = Math.floor(Date.now() / 1000);
 
     const baseString = `${PARTNER_ID}${apiPath}${timestamp}${ACCESS_TOKEN}${SHOP_ID}`;
     const sign = generateSign(baseString);
@@ -107,19 +136,33 @@ async function shopeeRequest(method, apiPath, params = {}, body = null) {
     };
     if (body) config.data = body;
 
+    let response;
     try {
-        return await axios(config);
+        response = await axios(config);
     } catch (err) {
-        if (err.response?.status === 403) {
-            console.log("🔄 Token expired. Attempting auto-refresh...");
-            const newTokens = await refreshAccessToken();
+        // Handle HTTP-level auth errors (403 etc.)
+        if (!_retried && (err.response?.status === 403 || err.response?.status === 401)) {
+            console.log("🔄 HTTP auth error. Attempting auto-refresh...");
+            const newTokens = await refreshAccessTokenWithRetry();
             if (newTokens) {
-                console.log("🚀 Retrying original request with new token...");
-                return await shopeeRequest(method, apiPath, params, body);
+                console.log("🚀 Retrying original request with fresh token...");
+                return await shopeeRequest(method, apiPath, params, body, true);
             }
         }
         throw err;
     }
+
+    // Handle Shopee's auth errors returned inside a 200 response body
+    if (!_retried && isShopeeAuthError(response)) {
+        console.log("🔄 Shopee auth error in response body. Attempting auto-refresh...", response.data?.error);
+        const newTokens = await refreshAccessTokenWithRetry();
+        if (newTokens) {
+            console.log("🚀 Retrying original request with fresh token...");
+            return await shopeeRequest(method, apiPath, params, body, true);
+        }
+    }
+
+    return response;
 }
 
 async function refreshAccessToken() {
@@ -134,13 +177,31 @@ async function refreshAccessToken() {
         );
 
         if (res.data.access_token) {
-            updateEnv({ access_token: res.data.access_token, refresh_token: res.data.refresh_token });
+            // ✅ Always save BOTH tokens — Shopee rotates refresh_token on every call!
+            updateEnv({
+                access_token: res.data.access_token,
+                refresh_token: res.data.refresh_token  // CRITICAL: new refresh_token must be saved immediately
+            });
+            console.log("✅ Tokens refreshed and saved (access + refresh).");
             return res.data;
+        } else {
+            console.error("❌ Refresh response missing access_token:", res.data);
+            return null;
         }
     } catch (err) {
         console.error("❌ Auto-refresh failed:", err.response?.data || err.message);
         return null;
     }
+}
+
+// 🔄 Refresh with retry: if first attempt fails, wait 30s and try once more
+async function refreshAccessTokenWithRetry() {
+    const result = await refreshAccessToken();
+    if (result) return result;
+
+    console.log("⚠️ First refresh attempt failed. Retrying in 30 seconds...");
+    await new Promise(resolve => setTimeout(resolve, 30000));
+    return await refreshAccessToken();
 }
 
 ///////////////////////////////////////////////////////////
@@ -195,9 +256,9 @@ app.get("/orders-by-ship-date", async (req, res) => {
         //           may fall before the target SGT midnight, e.g. orders shipped early SGT morning)
         // timeTo:   end of target date in SGT + 1 day buffer for safety
         const targetDateSGTStart = new Date(`${targetDateStr}T00:00:00+08:00`);
-        const targetDateSGTEnd   = new Date(`${targetDateStr}T23:59:59+08:00`);
+        const targetDateSGTEnd = new Date(`${targetDateStr}T23:59:59+08:00`);
         const timeFrom = Math.floor(targetDateSGTStart.getTime() / 1000) - (2 * 24 * 3600); // 2 days earlier
-        const timeTo   = Math.floor(targetDateSGTEnd.getTime()   / 1000) + (24 * 3600);     // +1 day buffer
+        const timeTo = Math.floor(targetDateSGTEnd.getTime() / 1000) + (24 * 3600);     // +1 day buffer
 
         // 1. Get List with Pagination
         let allOrders = [];
@@ -294,7 +355,7 @@ app.get("/", (req, res) => res.send("Shopee Integration Fully Automated 🚀"));
 
 // 🔄 Manual refresh endpoint
 app.get("/refresh", async (req, res) => {
-    const result = await refreshAccessToken();
+    const result = await refreshAccessTokenWithRetry();
     if (result) {
         res.json({ success: true, message: "Tokens refreshed!", access_token: result.access_token });
     } else {
@@ -302,17 +363,67 @@ app.get("/refresh", async (req, res) => {
     }
 });
 
-app.listen(PORT, () => {
+// 🩺 Token health status endpoint — check this without running anything else
+app.get("/status", (req, res) => {
+    const age = getTokenAge();
+    const hasAccessToken  = !!process.env.ACCESS_TOKEN;
+    const hasRefreshToken = !!process.env.REFRESH_TOKEN;
+    const hasShopId       = !!process.env.SHOP_ID;
+
+    const status = {
+        server: "running ✅",
+        shop_id: process.env.SHOP_ID || "missing ❌",
+        access_token:  hasAccessToken  ? `loaded ✅ (${process.env.ACCESS_TOKEN.slice(0, 20)}...)` : "missing ❌",
+        refresh_token: hasRefreshToken ? `loaded ✅ (${process.env.REFRESH_TOKEN.slice(0, 20)}...)` : "missing ❌",
+        token_file: TOKEN_FILE,
+        tokens_last_updated: age.updated_at || "never",
+        token_age: age.ageDays !== null ? `${age.ageDays} days ${age.ageHours} hours` : "unknown",
+        token_status: age.likelyExpired
+            ? "⚠️ LIKELY EXPIRED — tokens older than 30 days. Visit /auth to re-authenticate."
+            : "✅ Tokens appear fresh (< 30 days old)",
+        hint: age.likelyExpired
+            ? "Go to /auth to log in once and get fresh tokens. After that the server auto-refreshes forever."
+            : "Everything looks good. Auto-refresh runs every 3.5 hours."
+    };
+
+    res.json(status);
+});
+
+app.listen(PORT, async () => {
     console.log(`🚀 Server running on port ${PORT}`);
 
-    // ⏰ Auto-refresh tokens every 3 hours to keep them alive
+    // 🕒 Check token age on startup — warn if tokens are stale before trying to refresh
+    const age = getTokenAge();
+    if (age.ageDays !== null) {
+        console.log(`⏱️  Stored tokens are ${age.ageDays} days ${age.ageHours} hours old (last updated: ${age.updated_at})`);
+        if (age.likelyExpired) {
+            console.log("⚠️  WARNING: Tokens are older than 30 days — Shopee refresh_token may be expired!");
+            console.log("⚠️  If startup refresh fails below, visit /auth to re-authenticate manually.");
+        }
+    } else {
+        console.log("⚠️  No token age info found — this may be a fresh install or token file is missing.");
+    }
+
+    // 🚀 Immediate refresh on startup — ensures we always have a fresh token
+    // even after Azure cold starts or dyno restarts where the old token may be stale.
+    console.log("⏰ Performing startup token refresh...");
+    const startupResult = await refreshAccessTokenWithRetry();
+    if (startupResult) {
+        console.log("✅ Startup refresh successful! Tokens are fresh.");
+    } else {
+        console.log("❌ Startup refresh failed — stored refresh_token is likely expired.");
+        console.log("👉 ACTION REQUIRED: Visit /auth to re-authenticate and get fresh tokens.");
+    }
+
+    // ⏰ Auto-refresh tokens every 3.5 hours to keep them alive
+    // (Shopee access tokens expire after ~4 hours; refresh_token rotates on each use)
     setInterval(async () => {
         console.log("⏰ Scheduled token refresh...");
-        const result = await refreshAccessToken();
+        const result = await refreshAccessTokenWithRetry();
         if (result) {
             console.log("✅ Scheduled refresh successful!");
         } else {
-            console.log("❌ Scheduled refresh failed - tokens may have expired.");
+            console.log("❌ Scheduled refresh failed — may need to re-authenticate via /auth.");
         }
-    }, 3 * 60 * 60 * 1000); // Every 3 hours
+    }, 3.5 * 60 * 60 * 1000); // Every 3.5 hours
 });
