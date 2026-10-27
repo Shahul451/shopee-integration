@@ -194,14 +194,23 @@ async function refreshAccessToken() {
     }
 }
 
-// 🔄 Refresh with retry: if first attempt fails, wait 30s and try once more
+// 🔄 Refresh with retry: tries up to 5 times with increasing delays
+// Delays: 30s → 60s → 120s → 300s between attempts
 async function refreshAccessTokenWithRetry() {
-    const result = await refreshAccessToken();
+    const delays = [30000, 60000, 120000, 300000]; // wait times between retries
+    let result = await refreshAccessToken();
     if (result) return result;
 
-    console.log("⚠️ First refresh attempt failed. Retrying in 30 seconds...");
-    await new Promise(resolve => setTimeout(resolve, 30000));
-    return await refreshAccessToken();
+    for (let i = 0; i < delays.length; i++) {
+        const waitSec = delays[i] / 1000;
+        console.log(`⚠️ Refresh attempt ${i + 1} failed. Retrying in ${waitSec}s... (attempt ${i + 2} of 5)`);
+        await new Promise(resolve => setTimeout(resolve, delays[i]));
+        result = await refreshAccessToken();
+        if (result) return result;
+    }
+
+    console.error("❌ All 5 refresh attempts failed.");
+    return null;
 }
 
 ///////////////////////////////////////////////////////////
@@ -248,6 +257,20 @@ app.get("/callback", async (req, res) => {
 ///////////////////////////////////////////////////////////
 app.get("/orders-by-ship-date", async (req, res) => {
     try {
+        // 🔐 PROACTIVE TOKEN REFRESH — always refresh before running the job
+        // This is the most important guard: even if the background interval missed a beat
+        // (e.g. server restarted over the weekend), this ensures a fresh token every time.
+        console.log("🔐 Pre-flight: refreshing token before fetching orders...");
+        const preFlightResult = await refreshAccessTokenWithRetry();
+        if (!preFlightResult) {
+            console.error("❌ Pre-flight token refresh failed — cannot proceed safely.");
+            return res.status(503).json({
+                error: "token_refresh_failed",
+                message: "Could not refresh Shopee access token. Please visit /auth to re-authenticate."
+            });
+        }
+        console.log("✅ Pre-flight token refresh successful. Proceeding with order fetch.");
+
         const targetDateStr = req.query.date || new Date().toISOString().split('T')[0];
         console.log(`🔍 Filtering orders by ship date: ${targetDateStr} (SGT)`);
 
@@ -411,19 +434,32 @@ app.listen(PORT, async () => {
     if (startupResult) {
         console.log("✅ Startup refresh successful! Tokens are fresh.");
     } else {
-        console.log("❌ Startup refresh failed — stored refresh_token is likely expired.");
-        console.log("👉 ACTION REQUIRED: Visit /auth to re-authenticate and get fresh tokens.");
+        console.log("❌ Startup refresh failed after all retries — stored refresh_token may be expired.");
+        console.log("👉 Will keep retrying every 10 minutes automatically...");
+        // 🔁 Keep retrying every 10 minutes until a refresh succeeds
+        // This handles the Monday-morning weekend problem automatically
+        const recoveryInterval = setInterval(async () => {
+            console.log("🔁 Recovery attempt: retrying token refresh...");
+            const recovered = await refreshAccessToken();
+            if (recovered) {
+                console.log("✅ Recovery refresh succeeded! Tokens are now fresh.");
+                clearInterval(recoveryInterval); // stop retrying once successful
+            } else {
+                console.log("❌ Recovery refresh failed. Will retry again in 10 minutes.");
+                console.log("👉 If this keeps failing, visit /auth to re-authenticate.");
+            }
+        }, 10 * 60 * 1000); // every 10 minutes
     }
 
-    // ⏰ Auto-refresh tokens every 3.5 hours to keep them alive
-    // (Shopee access tokens expire after ~4 hours; refresh_token rotates on each use)
+    // ⏰ Auto-refresh tokens every 2 hours to keep them alive
+    // (Shopee access tokens expire after ~4 hours; 2h gives 2 extra chances per window)
     setInterval(async () => {
-        console.log("⏰ Scheduled token refresh...");
-        const result = await refreshAccessTokenWithRetry();
+        console.log("⏰ Scheduled token refresh (every 2h)...");
+        const result = await refreshAccessToken(); // single attempt — retries happen on-demand
         if (result) {
             console.log("✅ Scheduled refresh successful!");
         } else {
-            console.log("❌ Scheduled refresh failed — may need to re-authenticate via /auth.");
+            console.log("❌ Scheduled refresh failed — will retry at next interval or on next job run.");
         }
-    }, 3.5 * 60 * 60 * 1000); // Every 3.5 hours
+    }, 2 * 60 * 60 * 1000); // Every 2 hours
 });
